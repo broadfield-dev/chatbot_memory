@@ -10,10 +10,10 @@ A lightweight Python package for managing short-term and long-term memory with s
 
 ## Installation
 
-Install `memory_core` directly from GitHub:
+Install `chatbot_memory` directly from GitHub:
 
 ```bash
-pip install git+https://github.com/username/memory_core.git
+pip install git+https://github.com/broadfield-dev/chatbot_memory.git
 ```
 
 ### Dependencies
