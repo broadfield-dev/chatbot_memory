@@ -1,7 +1,7 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="memory_core",
+    name="chatbot_memory",
     version="0.1.0",
     packages=find_packages(),
     install_requires=[
@@ -11,10 +11,10 @@ setup(
         "huggingface_hub",
         "datasets"
     ],
-    author="Your Name",
+    author="broadfield-dev",
     author_email="your.email@example.com",
     description="A memory management package with short-term and long-term storage",
-    url="https://github.com/username/memory_core",
+    url="https://github.com/broadfield-dev/chatbot_memory",
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: MIT License",
