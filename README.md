@@ -1,4 +1,3 @@
-text
 # Chatbot Memory
 
 A lightweight Python package for managing short-term and long-term memory with support for multiple storage backends. This package provides a flexible memory system extracted from a Flask-based application, designed for easy integration into various chatbot projects.
