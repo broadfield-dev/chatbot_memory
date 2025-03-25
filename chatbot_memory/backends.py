@@ -1,137 +1,101 @@
-from abc import ABC, abstractmethod
-from datasets import Dataset, load_dataset
-from huggingface_hub import login
-import sqlite3
-import mysql.connector
-import os
+import chromadb
+from chromadb.utils import embedding_functions
+from datetime import datetime
+import logging
 
-class MemoryBackend(ABC):
-    @abstractmethod
-    def initialize(self):
-        pass
+# Set up logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
-    @abstractmethod
-    def add(self, text, metadata):
-        pass
+# Check if memory_analyze is available
+try:
+    from memory_analyze import analyze_data
+    HAS_ANALYZE = True
+    logger.info('memory_analyze is available')
+except ImportError:
+    HAS_ANALYZE = False
+    logger.warning('memory_analyze not installed, using default truthfulness and importance')
 
-    @abstractmethod
-    def update(self, id, metadata):
-        pass
+class MemoryManager:
+    def __init__(self, long_term_backend, max_short_term_size=50, analyze_kwargs=None):
+        self.logger = logger
+        self.max_short_term_size = max_short_term_size
+        self.analyze_kwargs = analyze_kwargs or {}  # Optional kwargs for memory_analyze
 
-    @abstractmethod
-    def query(self, text=None):
-        pass
+        # Short-term memory setup (ChromaDB)
+        self.chroma_client = chromadb.Client()
+        self.embedding_fn = embedding_functions.SentenceTransformerEmbeddingFunction(model_name='all-MiniLM-L6-v2')
+        self.short_term_collection = self.chroma_client.get_or_create_collection(
+            'short_term', embedding_function=self.embedding_fn
+        )
+        
+        # Long-term memory backend
+        self.long_term_backend = long_term_backend
+        self.long_term_backend.initialize()
 
-class SQLiteBackend(MemoryBackend):
-    def __init__(self, db_path="memory.db"):
-        self.db_path = db_path
+    def process_content(self, source, content, query='', default_truthfulness=0.5, default_importance=0.5):
+        '''Add content to short-term memory, optionally analyzing it if memory_analyze is installed.'''
+        timestamp = datetime.now().isoformat()
+        
+        if HAS_ANALYZE:
+            self.logger.debug(f'Processing with analyze_data: source={source}, content={content}, query={query}, kwargs={self.analyze_kwargs}')
+            facts = analyze_data(source, content, query, **self.analyze_kwargs)
+            self.logger.debug(f'Facts returned from analyze_data: {facts}')
+        else:
+            self.logger.debug('memory_analyze not available, using defaults')
+            facts = [{'text': content, 'truthfulness': default_truthfulness, 'importance': default_importance}]
 
-    def initialize(self):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS long_term (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    text TEXT UNIQUE,
-                    truthfulness REAL,
-                    importance REAL,
-                    timestamp TEXT,
-                    last_accessed TEXT
+        for fact in facts:
+            self.logger.debug(f'Storing fact: {fact}')
+            self.short_term_collection.add(
+                ids=[f'{source}_{timestamp}'],
+                documents=[fact['text']],
+                metadatas={
+                    'type': source,
+                    'timestamp': timestamp,
+                    'truthfulness': fact['truthfulness'],
+                    'importance': fact['importance']
+                }
+            )
+            self.consolidate_memory(fact['text'], fact['truthfulness'], fact['importance'])
+        
+        # Trim short-term memory if needed
+        if self.short_term_collection.count() > self.max_short_term_size:
+            oldest = self.short_term_collection.get(limit=1, include=['metadatas'])['metadatas'][0]['timestamp']
+            self.short_term_collection.delete(ids=[f'doc_{oldest}'])
+
+    def consolidate_memory(self, text, truthfulness, importance):
+        '''Move or update memory from short-term to long-term.'''
+        timestamp = datetime.now().isoformat()
+        results = self.short_term_collection.query(query_texts=[text], n_results=1)
+        
+        if results['distances'] and results['distances'][0] and results['distances'][0][0] < 0.2:
+            # Update existing long-term memory
+            existing_data = self.long_term_backend.query(text)
+            if existing_data:
+                existing_id, existing_meta = existing_data[0]
+                new_truth = min(1.0, (existing_meta['truthfulness'] + truthfulness) / 2 + 0.1)
+                new_importance = min(1.0, existing_meta['importance'] + 0.05)
+                self.long_term_backend.update(
+                    existing_id,
+                    {'truthfulness': new_truth, 'importance': new_importance, 'timestamp': timestamp, 'last_accessed': timestamp}
                 )
-            """)
+                return True
+        # Add new entry to long-term memory
+        self.long_term_backend.add(
+            text,
+            {'truthfulness': truthfulness, 'importance': importance, 'timestamp': timestamp, 'last_accessed': timestamp}
+        )
+        return True
 
-    def add(self, text, metadata):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO long_term (text, truthfulness, importance, timestamp, last_accessed) VALUES (?, ?, ?, ?, ?)",
-                (text, metadata["truthfulness"], metadata["importance"], metadata["timestamp"], metadata["last_accessed"])
-            )
+    def get_short_term(self):
+        '''Retrieve all short-term memory entries.'''
+        short_term = self.short_term_collection.get(include=['documents', 'metadatas'])
+        self.logger.debug(f'Short-term memory retrieved: {short_term}')
+        return short_term
 
-    def update(self, id, metadata):
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute(
-                "UPDATE long_term SET truthfulness=?, importance=?, timestamp=?, last_accessed=? WHERE id=?",
-                (metadata["truthfulness"], metadata["importance"], metadata["timestamp"], metadata["last_accessed"], id)
-            )
-
-    def query(self, text=None):
-        with sqlite3.connect(self.db_path) as conn:
-            if text:
-                cursor = conn.execute("SELECT id, text, truthfulness, importance, timestamp, last_accessed FROM long_term WHERE text LIKE ?", (f"%{text}%",))
-            else:
-                cursor = conn.execute("SELECT id, text, truthfulness, importance, timestamp, last_accessed FROM long_term")
-            return [(row[0], {"truthfulness": row[2], "importance": row[3], "timestamp": row[4], "last_accessed": row[5]}) for row in cursor.fetchall()]
-
-class MySQLBackend(MemoryBackend):
-    def __init__(self, host, user, password, database):
-        self.config = {"host": host, "user": user, "password": password, "database": database}
-
-    def initialize(self):
-        with mysql.connector.connect(**self.config) as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS long_term (
-                    id INT AUTO_INCREMENT PRIMARY KEY,
-                    text TEXT UNIQUE,
-                    truthfulness FLOAT,
-                    importance FLOAT,
-                    timestamp VARCHAR(255),
-                    last_accessed VARCHAR(255)
-                )
-            """)
-            conn.commit()
-
-    def add(self, text, metadata):
-        with mysql.connector.connect(**self.config) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "INSERT IGNORE INTO long_term (text, truthfulness, importance, timestamp, last_accessed) VALUES (%s, %s, %s, %s, %s)",
-                (text, metadata["truthfulness"], metadata["importance"], metadata["timestamp"], metadata["last_accessed"])
-            )
-            conn.commit()
-
-    def update(self, id, metadata):
-        with mysql.connector.connect(**self.config) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "UPDATE long_term SET truthfulness=%s, importance=%s, timestamp=%s, last_accessed=%s WHERE id=%s",
-                (metadata["truthfulness"], metadata["importance"], metadata["timestamp"], metadata["last_accessed"], id)
-            )
-            conn.commit()
-
-    def query(self, text=None):
-        with mysql.connector.connect(**self.config) as conn:
-            cursor = conn.cursor()
-            if text:
-                cursor.execute("SELECT id, text, truthfulness, importance, timestamp, last_accessed FROM long_term WHERE text LIKE %s", (f"%{text}%",))
-            else:
-                cursor.execute("SELECT id, text, truthfulness, importance, timestamp, last_accessed FROM long_term")
-            return [(row[0], {"truthfulness": row[2], "importance": row[3], "timestamp": row[4], "last_accessed": row[5]}) for row in cursor.fetchall()]
-
-class HuggingFaceBackend(MemoryBackend):
-    def __init__(self, dataset_name, token):
-        self.dataset_name = dataset_name
-        self.token = token
-        self.dataset = None
-
-    def initialize(self):
-        login(self.token)
-        try:
-            self.dataset = load_dataset(self.dataset_name, split="train")
-        except:
-            self.dataset = Dataset.from_dict({"text": [], "truthfulness": [], "importance": [], "timestamp": [], "last_accessed": []})
-
-    def add(self, text, metadata):
-        new_row = {"text": text, **metadata}
-        self.dataset = self.dataset.add_item(new_row)
-        self.dataset.push_to_hub(self.dataset_name, token=self.token)
-
-    def update(self, id, metadata):
-        data = self.dataset[id]
-        updated_row = {**data, **metadata}
-        self.dataset = self.dataset.map(lambda x, idx: updated_row if idx == id else x, with_indices=True)
-        self.dataset.push_to_hub(self.dataset_name, token=self.token)
-
-    def query(self, text=None):
-        if text:
-            return [(i, row) for i, row in enumerate(self.dataset) if text in row["text"]]
-        return [(i, row) for i, row in enumerate(self.dataset)]
+    def get_long_term(self, query_text=None):
+        '''Retrieve long-term memory entries, optionally filtered by query.'''
+        long_term = self.long_term_backend.query(query_text)
+        self.logger.debug(f'Long-term memory retrieved: {long_term}')
+        return long_term
