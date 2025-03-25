@@ -88,4 +88,3 @@ memory.process_content('user', 'The sky is blue', 'What color is the sky?')
 Feel free to submit issues or pull requests to the [GitHub repository](https://github.com/broadfield-dev/chatbot_memory).
 
 ## License
-MIT License
