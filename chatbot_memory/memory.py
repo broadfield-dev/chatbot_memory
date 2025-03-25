@@ -3,16 +3,22 @@ from chromadb.utils import embedding_functions
 from datetime import datetime
 import logging
 
+# Set up logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
 # Check if memory_analyze is available
 try:
     from memory_analyze import analyze_data
     HAS_ANALYZE = True
+    logger.info('memory_analyze is available')
 except ImportError:
     HAS_ANALYZE = False
+    logger.warning('memory_analyze not installed, using default truthfulness and importance')
 
 class MemoryManager:
     def __init__(self, long_term_backend, max_short_term_size=50, analyze_kwargs=None):
-        self.logger = logging.getLogger(__name__)
+        self.logger = logger
         self.max_short_term_size = max_short_term_size
         self.analyze_kwargs = analyze_kwargs or {}  # Optional kwargs for memory_analyze
 
@@ -32,13 +38,15 @@ class MemoryManager:
         timestamp = datetime.now().isoformat()
         
         if HAS_ANALYZE:
-            self.logger.debug('Using memory_analyze for content analysis')
+            self.logger.debug(f'Processing with analyze_data: source={source}, content={content}, query={query}, kwargs={self.analyze_kwargs}')
             facts = analyze_data(source, content, query, **self.analyze_kwargs)
+            self.logger.debug(f'Facts returned from analyze_data: {facts}')
         else:
-            self.logger.debug('memory_analyze not installed, using defaults')
+            self.logger.debug('memory_analyze not available, using defaults')
             facts = [{'text': content, 'truthfulness': default_truthfulness, 'importance': default_importance}]
 
         for fact in facts:
+            self.logger.debug(f'Storing fact: {fact}')
             self.short_term_collection.add(
                 ids=[f'{source}_{timestamp}'],
                 documents=[fact['text']],
@@ -82,8 +90,12 @@ class MemoryManager:
 
     def get_short_term(self):
         '''Retrieve all short-term memory entries.'''
-        return self.short_term_collection.get(include=['documents', 'metadatas'])
+        short_term = self.short_term_collection.get(include=['documents', 'metadatas'])
+        self.logger.debug(f'Short-term memory retrieved: {short_term}')
+        return short_term
 
     def get_long_term(self, query_text=None):
         '''Retrieve long-term memory entries, optionally filtered by query.'''
-        return self.long_term_backend.query(query_text)
+        long_term = self.long_term_backend.query(query_text)
+        self.logger.debug(f'Long-term memory retrieved: {long_term}')
+        return long_term
