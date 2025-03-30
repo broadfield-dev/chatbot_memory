@@ -32,7 +32,7 @@ class MemoryManager:
         
         # Long-term memory backend
         self.long_term_backend = long_term_backend
-        self.long_term_backend.initialize()
+        #self.long_term_backend.initialize()
 
     def process_content(self, source, content, query='', default_truthfulness=0.5, default_importance=0.5):
         '''Add content to short-term memory, analyzing it with memory_analyze if available.'''
