@@ -1,4 +1,4 @@
 from .memory import MemoryManager
-from .backends import SQLiteBackend, MySQLBackend, HuggingFaceBackend
+from .backends import SQLiteBackend, MySQLBackend
 
-__all__ = ["MemoryManager", "SQLiteBackend", "MySQLBackend", "HuggingFaceBackend"]
+__all__ = ["MemoryManager", "SQLiteBackend", "MySQLBackend"]
