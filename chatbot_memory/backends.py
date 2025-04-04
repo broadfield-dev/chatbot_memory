@@ -1,7 +1,7 @@
 import logging
 from typing import Dict, List, Any, Optional
 import mysql.connector
-from analyze import analyze_data
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
@@ -11,9 +11,17 @@ class MySQLBackend:
         self.user = user
         self.password = password
         self.database = database
+        try:
+            from memory_analyze import analyze_data
+            self.HAS_ANALYZE = True
+            self.analyze_data = analyze_data
+            logger.info('memory_analyze successfully imported')
+        except ImportError:
+            self.HAS_ANALYZE = False
+            self.analyze_data = None
+            logger.warning('memory_analyze not installed; using default truthfulness=0.5, importance=0.5')
 
     def initialize(self):
-        # This method might fail as per prior context; app.py handles fallback
         conn = mysql.connector.connect(
             host=self.host, user=self.user, password=self.password, database=self.database
         )
@@ -45,11 +53,10 @@ class MySQLBackend:
         timestamp = metadata.get('timestamp', datetime.now().isoformat())
         last_accessed = metadata.get('last_accessed', timestamp)
         
-        # Ensure initial values are set
         truthfulness = metadata.get('truthfulness', 0.5)
         importance = metadata.get('importance', 0.5)
         sentiment = metadata.get('sentiment', 'neutral')
-        source = metadata.get('type', 'unknown')  # 'type' renamed to 'source' for clarity
+        source = metadata.get('type', 'unknown')
         parent = metadata.get('parent', None)
 
         cursor.execute("""
@@ -109,8 +116,6 @@ class MySQLBackend:
         conn.close()
         return results
 
-from datetime import datetime
-
 class MemoryManager:
     def __init__(self, long_term_backend: MySQLBackend, max_short_term_size: int = 50, analyze_kwargs: Dict[str, Any] = None):
         self.long_term_backend = long_term_backend
@@ -119,13 +124,16 @@ class MemoryManager:
         self.analyze_kwargs = analyze_kwargs or {}
 
     def process_content(self, source: str, content: str, query: str, parent_id: Optional[int] = None):
-        # Analyze content for initial values
-        analysis = analyze_data(source, content, query, **self.analyze_kwargs)
-        if not analysis or 'text' not in analysis[0]:
-            logger.error(f"Analysis failed for content: {content}")
+        # Analyze content for initial values if package is available
+        if self.long_term_backend.HAS_ANALYZE:
+            analysis = self.long_term_backend.analyze_data(source, content, query, **self.analyze_kwargs)
+            if not analysis or 'text' not in analysis[0]:
+                logger.error(f"Analysis failed for content: {content}")
+                analysis = [{'text': content, 'truthfulness': 0.5, 'importance': 0.5, 'sentiment': 'neutral'}]
+        else:
             analysis = [{'text': content, 'truthfulness': 0.5, 'importance': 0.5, 'sentiment': 'neutral'}]
         
-        fact = analysis[0]  # Take the first fact for simplicity
+        fact = analysis[0]
         metadata = {
             'truthfulness': fact.get('truthfulness', 0.5),
             'importance': fact.get('importance', 0.5),
@@ -149,15 +157,22 @@ class MemoryManager:
         existing = self.long_term_backend.query(content, top_k=1)
         if existing:
             id_, existing_meta = existing[0]
-            # Reassess values based on new interaction
-            new_analysis = analyze_data(source, content, query, **self.analyze_kwargs)
-            if new_analysis and 'text' in new_analysis[0]:
-                new_fact = new_analysis[0]
+            # Reassess values if analysis is available
+            if self.long_term_backend.HAS_ANALYZE:
+                new_analysis = self.long_term_backend.analyze_data(source, content, query, **self.analyze_kwargs)
+                if new_analysis and 'text' in new_analysis[0]:
+                    new_fact = new_analysis[0]
+                    updated_meta = {
+                        'truthfulness': new_fact.get('truthfulness', existing_meta['truthfulness']),
+                        'importance': new_fact.get('importance', existing_meta['importance']),
+                        'sentiment': new_fact.get('sentiment', existing_meta['sentiment']),
+                        'source': source,
+                        'last_accessed': datetime.now().isoformat()
+                    }
+                    self.long_term_backend.update(id_, updated_meta)
+            else:
                 updated_meta = {
-                    'truthfulness': new_fact.get('truthfulness', existing_meta['truthfulness']),
-                    'importance': new_fact.get('importance', existing_meta['importance']),
-                    'sentiment': new_fact.get('sentiment', existing_meta['sentiment']),
-                    'source': source,  # Update source if relevant
+                    'source': source,
                     'last_accessed': datetime.now().isoformat()
                 }
                 self.long_term_backend.update(id_, updated_meta)
@@ -167,16 +182,20 @@ class MemoryManager:
 
     def get_long_term(self, query_text: str, top_k: int = 5) -> List[tuple]:
         results = self.long_term_backend.query(query_text, top_k)
-        # Update last_accessed and reassess values on access
+        # Update last_accessed and reassess values on access if analysis is available
         for id_, metadata in results:
-            new_analysis = analyze_data(metadata['source'], metadata['text'], query_text, **self.analyze_kwargs)
-            if new_analysis and 'text' in new_analysis[0]:
-                new_fact = new_analysis[0]
-                updated_meta = {
-                    'truthfulness': new_fact.get('truthfulness', metadata['truthfulness']),
-                    'importance': new_fact.get('importance', metadata['importance']),
-                    'sentiment': new_fact.get('sentiment', metadata['sentiment']),
-                    'last_accessed': datetime.now().isoformat()
-                }
+            if self.long_term_backend.HAS_ANALYZE:
+                new_analysis = self.long_term_backend.analyze_data(metadata['source'], metadata['text'], query_text, **self.analyze_kwargs)
+                if new_analysis and 'text' in new_analysis[0]:
+                    new_fact = new_analysis[0]
+                    updated_meta = {
+                        'truthfulness': new_fact.get('truthfulness', metadata['truthfulness']),
+                        'importance': new_fact.get('importance', metadata['importance']),
+                        'sentiment': new_fact.get('sentiment', metadata['sentiment']),
+                        'last_accessed': datetime.now().isoformat()
+                    }
+                    self.long_term_backend.update(id_, updated_meta)
+            else:
+                updated_meta = {'last_accessed': datetime.now().isoformat()}
                 self.long_term_backend.update(id_, updated_meta)
-        return self.long_term_backend.query(query_text, top_k)  # Re-fetch updated values
+        return self.long_term_backend.query(query_text, top_k)
