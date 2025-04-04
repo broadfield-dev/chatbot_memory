@@ -1,16 +1,14 @@
 import logging
 from typing import Dict, List, Any, Optional
 import mysql.connector
+import sqlite3
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-class MySQLBackend:
-    def __init__(self, host: str, user: str, password: str, database: str):
-        self.host = host
-        self.user = user
-        self.password = password
-        self.database = database
+class Backend:
+    """Base class for database backends."""
+    def __init__(self):
         try:
             from memory_analyze import analyze_data
             self.HAS_ANALYZE = True
@@ -20,6 +18,26 @@ class MySQLBackend:
             self.HAS_ANALYZE = False
             self.analyze_data = None
             logger.warning('memory_analyze not installed; using default truthfulness=0.5, importance=0.5')
+
+    def initialize(self):
+        raise NotImplementedError
+
+    def add(self, text: str, metadata: Dict[str, Any]) -> int:
+        raise NotImplementedError
+
+    def update(self, id_: int, metadata: Dict[str, Any]):
+        raise NotImplementedError
+
+    def query(self, query_text: str, top_k: int = 5) -> List[tuple]:
+        raise NotImplementedError
+
+class MySQLBackend(Backend):
+    def __init__(self, host: str, user: str, password: str, database: str):
+        super().__init__()
+        self.host = host
+        self.user = user
+        self.password = password
+        self.database = database
 
     def initialize(self):
         conn = mysql.connector.connect(
@@ -116,15 +134,98 @@ class MySQLBackend:
         conn.close()
         return results
 
+class SQLiteBackend(Backend):
+    def __init__(self, db_path: str):
+        super().__init__()
+        self.db_path = db_path
+
+    def initialize(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS long_term (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                text TEXT,
+                truthfulness REAL DEFAULT 0.5,
+                importance REAL DEFAULT 0.5,
+                sentiment TEXT DEFAULT 'neutral' CHECK(sentiment IN ('positive', 'negative', 'neutral')),
+                source TEXT,
+                parent INTEGER,
+                timestamp TEXT,
+                last_accessed TEXT,
+                UNIQUE(text),
+                FOREIGN KEY (parent) REFERENCES long_term(id) ON DELETE SET NULL
+            )
+        """)
+        conn.commit()
+        cursor.close()
+        conn.close()
+
+    def add(self, text: str, metadata: Dict[str, Any]) -> int:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        timestamp = metadata.get('timestamp', datetime.now().isoformat())
+        last_accessed = metadata.get('last_accessed', timestamp)
+        
+        truthfulness = metadata.get('truthfulness', 0.5)
+        importance = metadata.get('importance', 0.5)
+        sentiment = metadata.get('sentiment', 'neutral')
+        source = metadata.get('type', 'unknown')
+        parent = metadata.get('parent', None)
+
+        cursor.execute("""
+            INSERT OR REPLACE INTO long_term (text, truthfulness, importance, sentiment, source, parent, timestamp, last_accessed)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (text, truthfulness, importance, sentiment, source, parent, timestamp, last_accessed))
+        
+        id_ = cursor.lastrowid
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return id_
+
+    def update(self, id_: int, metadata: Dict[str, Any]):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        updates = []
+        params = []
+        for key, value in metadata.items():
+            if key in ['truthfulness', 'importance', 'sentiment', 'source', 'parent', 'last_accessed']:
+                updates.append(f"{key} = ?")
+                params.append(value)
+        if updates:
+            params.append(id_)
+            cursor.execute(f"UPDATE long_term SET {', '.join(updates)} WHERE id = ?", params)
+            conn.commit()
+        cursor.close()
+        conn.close()
+
+    def query(self, query_text: str, top_k: int = 5) -> List[tuple]:
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, text, truthfulness, importance, sentiment, source, parent, timestamp, last_accessed
+            FROM long_term
+            WHERE text LIKE ?
+            ORDER BY importance DESC, last_accessed DESC
+            LIMIT ?
+        """, (f"%{query_text}%", top_k))
+        results = [(id_, {'text': text, 'truthfulness': truthfulness, 'importance': importance,
+                          'sentiment': sentiment, 'source': source, 'parent': parent,
+                          'timestamp': timestamp, 'last_accessed': last_accessed})
+                   for id_, text, truthfulness, importance, sentiment, source, parent, timestamp, last_accessed in cursor.fetchall()]
+        cursor.close()
+        conn.close()
+        return results
+
 class MemoryManager:
-    def __init__(self, long_term_backend: MySQLBackend, max_short_term_size: int = 50, analyze_kwargs: Dict[str, Any] = None):
+    def __init__(self, long_term_backend: Backend, max_short_term_size: int = 50, analyze_kwargs: Dict[str, Any] = None):
         self.long_term_backend = long_term_backend
         self.short_term = {'documents': [], 'metadatas': []}
         self.max_short_term_size = max_short_term_size
         self.analyze_kwargs = analyze_kwargs or {}
 
     def process_content(self, source: str, content: str, query: str, parent_id: Optional[int] = None):
-        # Analyze content for initial values if package is available
         if self.long_term_backend.HAS_ANALYZE:
             analysis = self.long_term_backend.analyze_data(source, content, query, **self.analyze_kwargs)
             if not analysis or 'text' not in analysis[0]:
@@ -144,7 +245,6 @@ class MemoryManager:
             'last_accessed': datetime.now().isoformat()
         }
 
-        # Add to short-term memory
         if content not in self.short_term['documents']:
             self.short_term['documents'].append(content)
             self.short_term['metadatas'].append(metadata)
@@ -153,11 +253,9 @@ class MemoryManager:
                 oldest_meta = self.short_term['metadatas'].pop(0)
                 self.long_term_backend.add(oldest_doc, oldest_meta)
 
-        # Update long-term if exists
         existing = self.long_term_backend.query(content, top_k=1)
         if existing:
             id_, existing_meta = existing[0]
-            # Reassess values if analysis is available
             if self.long_term_backend.HAS_ANALYZE:
                 new_analysis = self.long_term_backend.analyze_data(source, content, query, **self.analyze_kwargs)
                 if new_analysis and 'text' in new_analysis[0]:
@@ -182,7 +280,6 @@ class MemoryManager:
 
     def get_long_term(self, query_text: str, top_k: int = 5) -> List[tuple]:
         results = self.long_term_backend.query(query_text, top_k)
-        # Update last_accessed and reassess values on access if analysis is available
         for id_, metadata in results:
             if self.long_term_backend.HAS_ANALYZE:
                 new_analysis = self.long_term_backend.analyze_data(metadata['source'], metadata['text'], query_text, **self.analyze_kwargs)
@@ -199,3 +296,4 @@ class MemoryManager:
                 updated_meta = {'last_accessed': datetime.now().isoformat()}
                 self.long_term_backend.update(id_, updated_meta)
         return self.long_term_backend.query(query_text, top_k)
+
